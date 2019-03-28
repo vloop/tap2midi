@@ -40,7 +40,7 @@
         __typeof__ (b) _b = (b); \
        _a > _b ? _b : _a; })
 
-#define debug
+// #define debug
 
 #define buf_frames (64)
 // #define channels (2)
@@ -66,7 +66,13 @@ void send_note_on(int channel, int note, int velocity){
     ch[0] = 0x90 + (channel & 0x0F);
     ch[1] = note & 0x7F;
     ch[2] = velocity & 0x7F;
-    if (verbose) printf("\nMIDI note on %x %x %x", (unsigned int)ch[0], (unsigned int)ch[1], (unsigned int)ch[2]);
+    if (verbose){
+        if (ch[2]){
+            printf("\nMIDI note on %x %x %x", (unsigned int)ch[0], (unsigned int)ch[1], (unsigned int)ch[2]);
+        }else{
+            printf("\nMIDI note off %x %x", (unsigned int)ch[0], (unsigned int)ch[1]);
+        }
+    }
     snd_rawmidi_write(handle_out, ch, 3);
     snd_rawmidi_drain(handle_out);
 }
@@ -133,10 +139,25 @@ void find_peak_S24_3LE(int channel_count, char *buf, int *max_l, int *previous_m
     }
 }
 
+void usage(char *prog_name){
+    printf("Usage: %s [OPTION]...\n\n", prog_name);
+    printf("-v          verbose\n");
+    printf("-h          display this message\n");
+    printf("-r rate     sample rate (Hz)\n");
+    printf("-c channels channel count\n");
+    printf("-d rate     envelope decay rate (per buffer)\n");
+    printf("-D device   alsa sound input device\n");
+    printf("-g factor   initial gain of envelope (db)\n");
+    printf("-l level    trigger level (db, must be negative)\n");
+    printf("-t time     retrigger delay time (ms)\n");
+}
+
 int main (int argc, char *argv[])
 {
     int i;
     int err;
+    int errcount=0;
+    char *device_name = "default";
     int sample_rate = 44100; // Will be updated by ALSA
     int channels = 2, channel_bytes, frame_bytes, buf_bytes;
     int max_sample_value = 0x7FFFFF; // 24SE -> 3 bytes per sample
@@ -154,33 +175,45 @@ int main (int argc, char *argv[])
     // ln(q)=G * ln(2)/-6 ==> q = exp(G * ln(2)/-6)
 
     // Handle command-line arguments
-    int arg = 2;
+    int arg = 1;
+    //~ if (argc>1){
+        //~ device_name = argv[1];
+        //~ arg++;
+    //~ }
     while(arg<argc){
         // printf("%s\n", argv[arg]);
         if (argv[arg][0]!='-'){
-            fprintf(stderr, "%s: not an option\n", argv[arg]);
+            fprintf(stderr, "%s: not an option.\n", argv[arg]);
+            errcount++;
         }else{ // Found dash, we know [1] is not past end of string
             if ( argv[arg][1] && (argv[arg][2] == 0)){ // Length is ok
                 switch(argv[arg][1]){
+                    case 'h':
+                        usage(argv[0]);
+                        exit(0);
                     case 'v':
                         verbose++;
                         break;
                     case 'r': // Sample rate
                         if ((++arg)<argc){
                             if (sscanf(argv[arg], "%d%c", &sample_rate, &bidon) != 1) {
-                                fprintf(stderr, "%s: not an integer\n", argv[arg]);
+                                fprintf(stderr, "%s: not an integer.\n", argv[arg]);
+                                errcount++;
                             }
                         }else{
-                            fprintf(stderr, "%s: missing value\n", argv[--arg]);
+                            fprintf(stderr, "%s: missing value.\n", argv[--arg]);
+                            errcount++;
                         }
                         break;
                     case 'c': // channel count
                         if ((++arg)<argc){
                             if (sscanf(argv[arg], "%d%c", &channels, &bidon) != 1) {
-                                fprintf(stderr, "%s: not an integer\n", argv[arg]);
+                                fprintf(stderr, "%s: not an integer.\n", argv[arg]);
+                                errcount++;
                             }
                         }else{
-                            fprintf(stderr, "%s: missing value\n", argv[--arg]);
+                            fprintf(stderr, "%s: missing value.\n", argv[--arg]);
+                            errcount++;
                         }
                         break;
                     case 'd': // decay value
@@ -188,29 +221,42 @@ int main (int argc, char *argv[])
                         // FIXME This is per frame, parameter should be independant of frame size
                         if ((++arg)<argc){
                             if (sscanf(argv[arg], "%f%c", &decay_rate_default, &bidon) != 1) {
-                                fprintf(stderr, "%s: not a float\n", argv[arg]);
+                                fprintf(stderr, "%s: not a float.\n", argv[arg]);
+                                errcount++;
                             }
                         }else{
-                            fprintf(stderr, "%s: missing value\n", argv[--arg]);
+                            fprintf(stderr, "%s: missing value.\n", argv[--arg]);
+                            errcount++;
+                        }
+                        break;
+                    case 'D': // device name
+                        if ((++arg)<argc){
+                            device_name = argv[arg];
+                        }else{
+                            fprintf(stderr, "%s: missing value.\n", argv[--arg]);
+                            errcount++;
                         }
                         break;
                     case 'g': // guard factor (envelope overshoot)
-                        // FIXME use db
                         if ((++arg)<argc){
                             if (sscanf(argv[arg], "%f%c", &decay_factor_db, &bidon) != 1) {
                                 fprintf(stderr, "%s: not a float\n", argv[arg]);
+                                errcount++;
                             }
                         }else{
-                            fprintf(stderr, "%s: missing value\n", argv[--arg]);
+                            fprintf(stderr, "%s: missing value.\n", argv[--arg]);
+                            errcount++;
                         }
                         break;
                     case 'l': // trigger level, -db
                         if ((++arg)<argc){
                             if (sscanf(argv[arg], "%f%c", &trigger_level_db, &bidon) != 1) {
-                                fprintf(stderr, "%s: not a float\n", argv[arg]);
+                                fprintf(stderr, "%s: not a float.\n", argv[arg]);
+                                errcount++;
                             }
                         }else{
-                            fprintf(stderr, "%s: missing value\n", argv[--arg]);
+                            fprintf(stderr, "%s: missing value.\n", argv[--arg]);
+                            errcount++;
                         }
                         break;
                         /*
@@ -227,28 +273,40 @@ int main (int argc, char *argv[])
                     case 't': // (re-)trigger delay in milliseconds
                         if ((++arg)<argc){
                             if (sscanf(argv[arg], "%f%c", &trig_delay_ms, &bidon) != 1) {
-                                fprintf(stderr, "%s: not a float\n", argv[arg]);
+                                fprintf(stderr, "%s: not a float.\n", argv[arg]);
+                                errcount++;
                             }
                         }else{
-                            fprintf(stderr, "%s: missing value\n", argv[--arg]);
+                            fprintf(stderr, "%s: missing value.\n", argv[--arg]);
+                            errcount++;
                         }
                         break;
                     default:
-                    fprintf(stderr, "%s: unknown option\n", argv[arg]);
+                    fprintf(stderr, "%s: unknown option.\n", argv[arg]);
+                    errcount++;
                 }
             }else{
-                fprintf(stderr, "%s: unknown option\n", argv[arg]);
+                fprintf(stderr, "%s: unknown option.\n", argv[arg]);
+                errcount++;
             }
         }
         arg++;
     }
+    
+    if(errcount){
+        usage(argv[0]);
+        fprintf(stderr, "Aborting.\n");
+        exit(-1);
+    }
 
     // Prepare audio device for input
-    if ((err = snd_pcm_open (&capture_handle, argv[1], SND_PCM_STREAM_CAPTURE, 0)) < 0) {
+    if ((err = snd_pcm_open (&capture_handle, device_name, SND_PCM_STREAM_CAPTURE, 0)) < 0) {
         fprintf (stderr, "cannot open audio device %s (%s)\n", 
-             argv[1],
+             device_name,
              snd_strerror(err));
         exit (1);
+    }else{
+        printf ("audio device set to %s\n", device_name);
     }
        
     if ((err = snd_pcm_hw_params_malloc (&hw_params)) < 0) {
@@ -279,13 +337,13 @@ int main (int argc, char *argv[])
             channel_bytes = 2;
             max_sample_value = 0x7FFF;
             f = find_peak_S16_LE;
-            fprintf (stderr, "sample format set to S16_LE\n");
+            printf ("sample format set to S16_LE\n");
         }
     }else{
         channel_bytes = 3;
         max_sample_value = 0x7FFFFF;
         f = find_peak_S24_3LE;
-        fprintf (stderr, "sample format set to S24_3LE\n");
+        printf ("sample format set to S24_3LE\n");
     }
     frame_bytes = channels * channel_bytes;
     buf_bytes = buf_frames * frame_bytes;
