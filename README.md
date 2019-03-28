@@ -37,21 +37,21 @@ You need to adjust the parameters to match your mic, soundcard and playing style
 
 -d rate     envelope decay rate (per buffer)
 
-            typically 0.97..0.99, higher values mean more anti-bouncing
+  typically 0.97..0.99, higher values mean more anti-bouncing
 
 -D device   alsa sound input device
 
 -g factor   initial gain of envelope (db)
 
-            typically 0, higher values mean more anti-bouncing
+  typically 0, higher values mean more anti-bouncing
 
 -l level    trigger level (db, must be negative)
 
-            typically -36..-24, more negative values mean more sensitivity
+  typically -36..-24, more negative values mean more sensitivity
 
 -t time     retrigger delay time (ms)
 
-            typically 0, higher values mean more anti-bouncing
+  typically 0, higher values mean more anti-bouncing
 
 
 ## Authors
