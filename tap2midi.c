@@ -23,6 +23,11 @@
 //   use parameter -d followed by decay rate per buffer FIXME
 //   and parameter -g guard factor (envelope overshoot) FIXME
 
+// TODO list
+// flush stdout at every printf
+// OSC for individual audio channel parameters, including midi settings
+// Gui to send OSC messages, save and read file
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <alsa/asoundlib.h>
@@ -60,7 +65,7 @@ void intHandler(int dummy) {
     fprintf (stderr, "Interrupted!\n");
 }
 void send_note_on(int channel, int note, int velocity){
-    // send midi note on message
+    // send midi note on or off message
     // velocity = 0 means note off
     unsigned char ch[3];
     ch[0] = 0x90 + (channel & 0x0F);
@@ -68,13 +73,19 @@ void send_note_on(int channel, int note, int velocity){
     ch[2] = velocity & 0x7F;
     if (verbose){
         if (ch[2]){
-            printf("\nMIDI note on %x %x %x", (unsigned int)ch[0], (unsigned int)ch[1], (unsigned int)ch[2]);
+            fprintf(stderr, "\nMIDI note on %x %x %x ", (unsigned int)ch[0], (unsigned int)ch[1], (unsigned int)ch[2]);
         }else{
-            printf("\nMIDI note off %x %x", (unsigned int)ch[0], (unsigned int)ch[1]);
+            fprintf(stderr, "\nMIDI note off %x %x ", (unsigned int)ch[0], (unsigned int)ch[1]);
         }
     }
     snd_rawmidi_write(handle_out, ch, 3);
-    snd_rawmidi_drain(handle_out);
+    //~ snd_rawmidi_write(handle_out, &ch[0], 1);
+    //~ snd_rawmidi_write(handle_out, &ch[1], 1);
+    //~ snd_rawmidi_write(handle_out, &ch[2], 1);
+    snd_rawmidi_drain(handle_out); // Not always effective??
+}
+void send_note_off(int channel, int note){
+    send_note_on(channel, note, 0);
 }
 
 void (*f)(int channel_count, char *buf2, int *max_l, int *previous_max_l, int *previous_max_v);
@@ -141,15 +152,22 @@ void find_peak_S24_3LE(int channel_count, char *buf, int *max_l, int *previous_m
 
 void usage(char *prog_name){
     printf("Usage: %s [OPTION]...\n\n", prog_name);
-    printf("-v          verbose\n");
-    printf("-h          display this message\n");
-    printf("-r rate     sample rate (Hz)\n");
     printf("-c channels channel count\n");
     printf("-d rate     envelope decay rate (per buffer)\n");
+    printf("            typically 0.97..0.99, higher values mean more anti-bouncing\n");
     printf("-D device   alsa sound input device\n");
+    printf("-f          faster slope detection (may cause double-triggering)\n");
     printf("-g factor   initial gain of envelope (db)\n");
+    printf("            typically 0, higher values mean more anti-bouncing\n");
+    printf("-h          display this help message\n");
     printf("-l level    trigger level (db, must be negative)\n");
+    printf("            typically -36..-24, more negative values mean more sensitivity\n");
+    printf("-r rate     sample rate (Hz)\n");
     printf("-t time     retrigger delay time (ms)\n");
+    printf("            typically 0, higher values mean more anti-bouncing\n");
+    printf("-v          verbose\n");
+    printf("-x time     note off (extinction) delay time (ms)\n");
+    printf("-X          force note off (extinction) before new note\n");
 }
 
 int main (int argc, char *argv[])
@@ -165,12 +183,15 @@ int main (int argc, char *argv[])
     char bidon;
     snd_pcm_t *capture_handle;
     snd_pcm_hw_params_t *hw_params;
-    float trig_delay_ms = 10;
+    float trig_delay_ms = 0;
     int trig_delay_frames_default;
     float decay_rate_default = 0.98;
-    float decay_factor_default = 2.0;
+    float decay_factor_default;
     float decay_factor_db = 6.0;
     float trigger_level_db = -30.0; // full range 0x7FFFFF / 0x7FFF = 256 ==> -48db = -6 * ln(256)/ln(2)
+    float max_note_off_delay_ms = 250.0;
+    int force_note_off = 0;
+    int single_buffer = 0;
     int trig_level_default;
     // ln(q)=G * ln(2)/-6 ==> q = exp(G * ln(2)/-6)
 
@@ -237,6 +258,9 @@ int main (int argc, char *argv[])
                             errcount++;
                         }
                         break;
+                    case 'f': // Fast slope detection
+                        single_buffer = 1 ;
+                        break;
                     case 'g': // guard factor (envelope overshoot)
                         if ((++arg)<argc){
                             if (sscanf(argv[arg], "%f%c", &decay_factor_db, &bidon) != 1) {
@@ -280,6 +304,20 @@ int main (int argc, char *argv[])
                             fprintf(stderr, "%s: missing value.\n", argv[--arg]);
                             errcount++;
                         }
+                        break;
+                    case 'x': // Extinction (note-off) delay in milliseconds
+                        if ((++arg)<argc){
+                            if (sscanf(argv[arg], "%f%c", &max_note_off_delay_ms, &bidon) != 1) {
+                                fprintf(stderr, "%s: not a float.\n", argv[arg]);
+                                errcount++;
+                            }
+                        }else{
+                            fprintf(stderr, "%s: missing value.\n", argv[--arg]);
+                            errcount++;
+                        }
+                        break;
+                    case 'X': // Force extinction (note-off) before re-triggering
+                        force_note_off = 1;
                         break;
                     default:
                     fprintf(stderr, "%s: unknown option.\n", argv[arg]);
@@ -400,7 +438,6 @@ int main (int argc, char *argv[])
     int trig_level[channels];
     float decay[channels], decay_rate[channels], decay_factor[channels];
     unsigned int max_note_off_delay_bufs;
-    float max_note_off_delay_ms = 500.0; // FIXME make note_off_delay independant of frame size and sample rate
     int note_off_delay[channels];
     int midi_channel[channels], midi_note[channels];
     int rising[channels];
@@ -411,7 +448,8 @@ int main (int argc, char *argv[])
     int previous_max_v[channels], previous_previous_max_v[channels];
     int max_l[channels];
     float ms_per_buffer;
-    
+    long int bufcount=0;
+
     ms_per_buffer = (buf_frames * 1000.0)/(float)sample_rate;
     trig_delay_frames_default = roundf(trig_delay_ms * sample_rate) / buf_frames / 1000;
     trig_level_default = max_sample_value / exp(trigger_level_db * log(2)/-6.0); // FIXME must check >0 !!
@@ -435,20 +473,20 @@ int main (int argc, char *argv[])
     for(c = 0; c < channels; c++){
         // Parameters
         // FIXME set through command line or other (config file? OSC? midi in?)
-        // FIXME make parameter decay note_off_delay independant of frame size and sample rate
+        // FIXME make parameter decay independant of frame size and sample rate
         // FIXME use sensible units
         // FIXME should be a struct
         trig_delay_frames[c] = trig_delay_frames_default;
         trig_level[c] = trig_level_default;
         decay_rate[c] = decay_rate_default;
         decay_factor[c] = decay_factor_default; // Should this depend on sample #?
-        midi_channel[c] = c; // Default, midi output channels map 1:1 to soundcard inputs
+        midi_channel[c] = c & 0x0F; // Default, midi output channels map 1:1 to soundcard inputs
         midi_note[c] = 60;
         // State variables
-        rising[c] = 0;
+        rising[c] = 0; // Not rising
         decay[c] = 0.0;
-        waiting[c] = 0;
-        note_off_delay[c] = 0;
+        waiting[c] = 0; // Not waiting
+        note_off_delay[c] = 0; // No pending note
         max_l[c] = 0;
         previous_max_l[c] = 0;
         previous_previous_max_l[c] = 0;
@@ -461,9 +499,10 @@ int main (int argc, char *argv[])
         if ((err = snd_pcm_readi (capture_handle, buf, buf_frames)) != buf_frames) {
             fprintf (stderr, "read from audio interface failed (%s)\n",
                  snd_strerror(err));
-            exit (1);
+            keepRunning = 0;
+            //~ exit (1);
         }else{
-            
+            bufcount++;
             for(c = 0; c < channels; c++){
                 previous_previous_max_l[c] = previous_max_l[c];
                 previous_max_l[c] = max_l[c];
@@ -481,25 +520,35 @@ int main (int argc, char *argv[])
             // 6ms max reaction time should be ok when playing
             for(c = 0; c < channels; c++){
                 if (rising[c]){ // Trigger detected in previous buffer
-                    rising[c]++; // For stats
+                    rising[c]++; // For stats; should we set a limit?
 #ifdef debug
                     //~ fprintf (stderr, "r");
 #endif
-                    //~ if (max_l[c] < previous_max_l[c]){ // Max level started falling
-                    // What about requiring 2 consecutive falling buffers?
-                    // This can audibly increase latency
-                    if ((max_l[c] < previous_max_l[c]) && (previous_max_l[c] < previous_previous_max_l[c])){
+                    // Requiring 2 consecutive falling buffers can audibly increase latency
+                    if ((max_l[c] < previous_max_l[c]) && (single_buffer || (previous_max_l[c] < previous_previous_max_l[c]))){
+#ifdef debug
+                        fprintf (stderr, "f %u ", rising[c]);
+#endif
                         rising[c] = 0; // no longer rising
                         waiting[c] = trig_delay_frames[c]; // Start or restart wait period
                         //~ decay[c] = (float)(previous_max_l[c] - trig_level[c]) * decay_factor[c]; // ... and envelope
                         decay[c] = (float)(previous_previous_max_l[c] - trig_level[c]) * decay_factor[c]; // ... and envelope
                         // Prepare to send a note off after a certain number of frames
                         // could make it depend on hit strength?
+#ifdef debug
+                        fprintf (stderr, "\nI %u %u %lu ", c, note_off_delay[c], bufcount);
+#endif
+                        if(force_note_off && note_off_delay[c]){
+                            send_note_off(midi_channel[c], midi_note[c]);
+#ifdef debug
+                            fprintf (stderr, "\nX %u %u %lu ", c, note_off_delay[c], bufcount);
+#endif
+                        }
                         note_off_delay[c] = max_note_off_delay_bufs;
                         //~ send_note_on(midi_channel[c], midi_note[c], previous_max_v[c]);
                         send_note_on(midi_channel[c], midi_note[c], previous_previous_max_v[c]);
 #ifdef debug
-                        fprintf (stderr, "\n! %u %d", c, previous_previous_max_v[c]);
+                        fprintf (stderr, "\n! %u %d %lu ", c, previous_previous_max_v[c], bufcount);
 #endif
                     }
                 }else if (waiting[c]){
@@ -524,18 +573,19 @@ int main (int argc, char *argv[])
                         decay[c] *= decay_rate[c];
                     }
                 }
-                    
+                //~ fprintf (stderr, ". %u %u", c, note_off_delay[c]);
                 // Note off handling
                 if (note_off_delay[c]){
                     note_off_delay[c]--;
 #ifdef debug
-                    //~ fprintf (stderr, "n %u %u", c, note_off_delay[c]);
+                    fprintf (stderr, "n %u %u ", c, note_off_delay[c]);
 #endif
-                    if (note_off_delay[c] == 0){
+                    if (note_off_delay[c] <= 0){
+                        note_off_delay[c] = 0;
 #ifdef debug
-                        fprintf (stderr, "\n, %u", c);
+                        fprintf (stderr, "\nx %u %lu ", c, bufcount);
 #endif
-                        send_note_on(midi_channel[c], midi_note[c], 0);
+                        send_note_off(midi_channel[c], midi_note[c]);
                     }
                 }
             }
