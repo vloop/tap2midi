@@ -2,14 +2,34 @@
 // Marc Perilleux 2019
 // Detect taps on microphone or other sound input and triggers MIDI notes (velocity-sensitive)
 
+/*
+ *      This program is free software; you can redistribute it and/or modify it
+ *      under the terms of the GNU General Public License as published by the
+ *      Free Software Foundation; either version 2 of the License,
+ *      or (at your option) any later version.
+ *
+ *      This program is distributed in the hope that it will be useful,
+ *      but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *      MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *      GNU General Public License for more details.
+ *
+ *      You should have received a copy of the GNU General Public License
+ *      along with this program; if not, write to the Free Software
+ *      Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston,
+ *      MA 02110-1301, USA.
+ *
+*/
+
 // Includes code from http://equalarea.com/paul/alsa-audio.html Minimal Capture Program
 // Compile with:
 // gcc tap2midi.c -lasound -lm -o tap2midi
 // Use example (maybe a bit conservative):
 // wait time 8ms, trigger level -24 db
-// ./tap2midi hw:3,0 -d 0.98 -t 8 -l -24
+// ./tap2midi -D hw:3,0 -d 0.98 -t 8 -l -24
 // A little more responsive:
 // -d 0.98 -t 0 -l -30
+// Method 2:
+// ./tap2midi -D hw:2,0 -t 10 -w 100 -l -12
 // NB - to identify your soundcard (hw:3,0 above), use
 // arecord -l
 
@@ -47,7 +67,7 @@
 
 // #define debug
 
-#define buf_frames (64)
+#define buf_frames (256)
 // #define channels (2)
 // #define channel_bytes (3)
 // #define frame_bytes (channels*channel_bytes)
@@ -64,6 +84,7 @@ void intHandler(int dummy) {
     keepRunning = 0;
     fprintf (stderr, "Interrupted!\n");
 }
+
 void send_note_on(int channel, int note, int velocity){
     // send midi note on or off message
     // velocity = 0 means note off
@@ -84,6 +105,7 @@ void send_note_on(int channel, int note, int velocity){
     //~ snd_rawmidi_write(handle_out, &ch[2], 1);
     snd_rawmidi_drain(handle_out); // Not always effective??
 }
+
 void send_note_off(int channel, int note){
     send_note_on(channel, note, 0);
 }
@@ -150,6 +172,70 @@ void find_peak_S24_3LE(int channel_count, char *buf, int *max_l, int *previous_m
     }
 }
 
+// Method 2 helper functions
+int (*f_peak)(int channel_count, char *buf, int frame_count, int channel, int *peak);
+
+int find_channel_peak_S16_LE(int channel_count, char *buf, int frame_count, int channel, int *peak){
+    int frame, peak_frame;
+    peak_frame=-1;
+    int a;
+    for(frame = 0; frame < frame_count; frame++){
+		a=abs(((short int*)buf)[frame * channel_count + channel]);
+		if (a > *peak){
+			*peak=a;
+			peak_frame=frame;
+		}
+	}
+	return(peak_frame);
+}
+ 
+int find_channel_peak_S24_3LE(int channel_count, char *buf, int frame_count, int channel, int *peak){
+    int frame, frame_bytes, peak_frame;
+    int a;
+    frame_bytes = 3 * channel_count;
+    peak_frame=-1;
+    for(frame = 0; frame < frame_count; frame++){
+		a = buf[channel] | buf[channel+1]<<8 | buf[channel+2]<<16; // Unsigned)
+		if (a > 0x7FFFFF){ // Sample is negative
+			a = 0x1000000 - a ; // abs		
+		}
+		if (a > *peak){
+			*peak=a;
+			peak_frame=frame;
+		}
+		buf += frame_bytes;
+	}
+	return(peak_frame);
+}
+
+int (*f_trig)(int channel_count, char *buf, int frame_count, int channel, int trig_lvl);
+
+int find_channel_trig_S16_LE(int channel_count, char *buf, int frame_count, int channel, int trig_lvl){
+    int frame;
+    int a;
+    for(frame = 0; frame < frame_count; frame++){
+		a=abs(((short int*)buf)[frame * channel_count + channel]);
+		if (a>trig_lvl) return frame;
+	}
+	return(-1);
+}
+ 
+int find_channel_trig_S24_3LE(int channel_count, char *buf, int frame_count, int channel, int trig_lvl){
+    int frame, frame_bytes;
+    int peak = 0;
+    int a, l;
+    frame_bytes = 3 * channel_count;
+    for(frame = 0; frame < frame_count; frame++){
+		a = buf[channel] | buf[channel+1]<<8 | buf[channel+2]<<16; // Unsigned)
+		if (a > 0x7FFFFF){ // Sample is negative
+			a = 0x1000000 - a ; // abs		
+		}
+		if (a>trig_lvl) return frame;
+		buf += frame_bytes;
+	}
+	return(-1);
+}
+
 void usage(char *prog_name){
     printf("Usage: %s [OPTION]...\n\n", prog_name);
     printf("-c channels channel count\n");
@@ -183,8 +269,9 @@ int main (int argc, char *argv[])
     char bidon;
     snd_pcm_t *capture_handle;
     snd_pcm_hw_params_t *hw_params;
-    float trig_delay_ms = 0;
-    int trig_delay_frames_default;
+    float trig_delay_ms = 0, wait_delay_ms = 0;
+    int trig_delay_frames_default, trig_delay_buffers_default;
+    int wait_delay_frames_default, wait_delay_buffers_default;
     float decay_rate_default = 0.98;
     float decay_factor_default;
     float decay_factor_db = 6.0;
@@ -305,6 +392,19 @@ int main (int argc, char *argv[])
                             errcount++;
                         }
                         break;
+#ifndef method1
+                    case 'w': // re-trigger inhibit wait delay in milliseconds
+                        if ((++arg)<argc){
+                            if (sscanf(argv[arg], "%f%c", &wait_delay_ms, &bidon) != 1) {
+                                fprintf(stderr, "%s: not a float.\n", argv[arg]);
+                                errcount++;
+                            }
+                        }else{
+                            fprintf(stderr, "%s: missing value.\n", argv[--arg]);
+                            errcount++;
+                        }
+                        break;
+#endif             
                     case 'x': // Extinction (note-off) delay in milliseconds
                         if ((++arg)<argc){
                             if (sscanf(argv[arg], "%f%c", &max_note_off_delay_ms, &bidon) != 1) {
@@ -375,12 +475,16 @@ int main (int argc, char *argv[])
             channel_bytes = 2;
             max_sample_value = 0x7FFF;
             f = find_peak_S16_LE;
+            f_peak = find_channel_peak_S16_LE;
+            f_trig = find_channel_trig_S16_LE;
             printf ("sample format set to S16_LE\n");
         }
     }else{
         channel_bytes = 3;
         max_sample_value = 0x7FFFFF;
         f = find_peak_S24_3LE;
+        f_peak = find_channel_peak_S24_3LE;
+        f_trig = find_channel_trig_S24_3LE;
         printf ("sample format set to S24_3LE\n");
     }
     frame_bytes = channels * channel_bytes;
@@ -431,15 +535,18 @@ int main (int argc, char *argv[])
     signal(SIGINT, intHandler);
 
     // Tested values ok for 128 frames:
-    // trig_delay_frames = 4, decay_rate = 0.98, decay_factor = 2.0
+    // trig_delay_buffers = 4, decay_rate = 0.98, decay_factor = 2.0
     // 4 x 128 frames at 44100 Hz = 11.6 ms
     // T = 1/ln(0.98) = 49 buffers
-    int waiting[channels], trig_delay_frames[channels]; // Used for de-bouncing
+    int waiting[channels], trig_delay_buffers[channels]; // Used for de-bouncing
     int trig_level[channels];
-    float decay[channels], decay_rate[channels], decay_factor[channels];
     unsigned int max_note_off_delay_bufs;
     int note_off_delay[channels];
     int midi_channel[channels], midi_note[channels];
+
+#ifdef meth1            
+     // Method 1 specific
+    float decay[channels], decay_rate[channels], decay_factor[channels];
     int rising[channels];
     // These can be used for slope detection
     //~ int previous[channels];
@@ -447,27 +554,49 @@ int main (int argc, char *argv[])
     int previous_max_l[channels], previous_previous_max_l[channels];
     int previous_max_v[channels], previous_previous_max_v[channels];
     int max_l[channels];
-    float ms_per_buffer;
-    long int bufcount=0;
-
-    ms_per_buffer = (buf_frames * 1000.0)/(float)sample_rate;
-    trig_delay_frames_default = roundf(trig_delay_ms * sample_rate) / buf_frames / 1000;
-    trig_level_default = max_sample_value / exp(trigger_level_db * log(2)/-6.0); // FIXME must check >0 !!
-
     decay_factor_default = exp(decay_factor_db* log(2)/6.0);
     printf("decay initial factor %f db, value %f\n", decay_factor_db, decay_factor_default);
+    printf("decay per buffer: %f\n", decay_rate_default);
+#else    
+    // Method 2 specific
+    typedef enum {
+        STATE_IDLE, // Until trig level reached
+        STATE_PEAK, // Scan for peak until time elapsed
+        STATE_WAIT, // Inhibit retrigger until time2 elapsed
+        STATE_UNKNOWN // Only for init
+	} State;
+	const char * state_names[] = {"IDLE", "PEAK", "WAIT"};
+	State state[channels];
+    State old_state[channels];
+	int peak_frames[channels], wait_frames[channels], frame_count[channels];
+	int peak_level[channels];// , trig_frame[channels];
+#endif
+	
+    float ms_per_buffer;
+    long int bufcount=0;
+    
+    frame_bytes = channel_bytes * channels;
+    ms_per_buffer = (buf_frames * 1000.0)/(float)sample_rate;
+    trig_delay_frames_default = roundf(trig_delay_ms * sample_rate) / 1000;
+    trig_delay_buffers_default = trig_delay_frames_default / buf_frames;
+    wait_delay_frames_default = roundf(wait_delay_ms * sample_rate) / 1000;
+    wait_delay_buffers_default = wait_delay_frames_default / buf_frames;
+    trig_level_default = max_sample_value / exp(trigger_level_db * log(2)/-6.0); // FIXME must check >0 !!
+    printf("trigger level %f db factor %u, value %u\n", trigger_level_db, (int)(exp(trigger_level_db * log(2)/-6.0)), trig_level_default);
 
     max_note_off_delay_bufs = (unsigned int )(max_note_off_delay_ms / ms_per_buffer);
     printf("note off delay %u buffers (%f ms)\n", max_note_off_delay_bufs, max_note_off_delay_bufs * ms_per_buffer);
 
-    printf("re-trigger delay (buffers): %lu (%f ms)\n",
-        trig_delay_frames_default,
-        trig_delay_frames_default * ms_per_buffer
-        );
     printf("buffer length: %u frames (%u bytes)\n", buf_frames, buf_bytes);
     printf("time per buffer: %f ms\n", ms_per_buffer);
-    printf("decay per buffer: %f\n", decay_rate_default);
-    printf("trigger level factor %lu, value %lu\n", (int)(exp(trigger_level_db * log(2)/-6.0)), trig_level_default);
+    printf("re-trigger delay (buffers): %u (%f ms)\n",
+        trig_delay_buffers_default,
+        trig_delay_buffers_default * ms_per_buffer
+        );
+    printf("re-trigger delay (frames): %u (%f ms)\n",
+        trig_delay_frames_default,
+        (float)trig_delay_frames_default * 1000 / sample_rate
+        );
 
     int c;
     for(c = 0; c < channels; c++){
@@ -476,33 +605,50 @@ int main (int argc, char *argv[])
         // FIXME make parameter decay independant of frame size and sample rate
         // FIXME use sensible units
         // FIXME should be a struct
-        trig_delay_frames[c] = trig_delay_frames_default;
         trig_level[c] = trig_level_default;
+		printf("channel %u trigger level %u\n", c, trig_level[c]);
+#ifdef meth1            
+        trig_delay_buffers[c] = trig_delay_buffers_default;
         decay_rate[c] = decay_rate_default;
         decay_factor[c] = decay_factor_default; // Should this depend on sample #?
-        midi_channel[c] = c & 0x0F; // Default, midi output channels map 1:1 to soundcard inputs
-        midi_note[c] = 60;
         // State variables
         rising[c] = 0; // Not rising
         decay[c] = 0.0;
         waiting[c] = 0; // Not waiting
-        note_off_delay[c] = 0; // No pending note
         max_l[c] = 0;
         previous_max_l[c] = 0;
         previous_previous_max_l[c] = 0;
+#else
+		wait_frames[c] = wait_delay_frames_default;
+		peak_frames[c] = trig_delay_frames_default;
+		printf("channel %u peak window %u frames retrigger inhibit %u frames\n", c, peak_frames[c], wait_frames[c]);
+        state[c]=STATE_IDLE;
+        old_state[c]=STATE_UNKNOWN;
+#endif
+        midi_channel[c] = c & 0x0F; // Default, midi output channels map 1:1 to soundcard inputs
+        midi_note[c] = 60;
+        note_off_delay[c] = 0; // No pending note
         //~ previous[c] = 0;
         //~ max_d[c] = 0;
+        
     }
+    
+    ///////////////
+    // Main loop //
+    ///////////////
     printf ("About to start reading\n");
-
     while (keepRunning) { 
         if ((err = snd_pcm_readi (capture_handle, buf, buf_frames)) != buf_frames) {
             fprintf (stderr, "read from audio interface failed (%s)\n",
                  snd_strerror(err));
             keepRunning = 0;
             //~ exit (1);
-        }else{
+        }else{ // Audio read success
             bufcount++;
+#ifdef debug
+            fprintf (stderr, ".");
+#endif
+#ifdef meth1            
             for(c = 0; c < channels; c++){
                 previous_previous_max_l[c] = previous_max_l[c];
                 previous_max_l[c] = max_l[c];
@@ -510,7 +656,6 @@ int main (int argc, char *argv[])
                 previous_previous_max_v[c] = previous_max_v[c];
                 //~ max_d[c] = 0; // d for difference (always positive) // FIXME use previous[c]
             }
-            
             // Format-dependant peak detection
             (*f)(channels, buf, max_l, previous_max_l, previous_max_v);//, previous_previous_max_l, previous_previous_max_v);
 
@@ -530,7 +675,7 @@ int main (int argc, char *argv[])
                         fprintf (stderr, "f %u ", rising[c]);
 #endif
                         rising[c] = 0; // no longer rising
-                        waiting[c] = trig_delay_frames[c]; // Start or restart wait period
+                        waiting[c] = trig_delay_buffers[c]; // Start or restart wait period
                         //~ decay[c] = (float)(previous_max_l[c] - trig_level[c]) * decay_factor[c]; // ... and envelope
                         decay[c] = (float)(previous_previous_max_l[c] - trig_level[c]) * decay_factor[c]; // ... and envelope
                         // Prepare to send a note off after a certain number of frames
@@ -588,9 +733,97 @@ int main (int argc, char *argv[])
                         send_note_off(midi_channel[c], midi_note[c]);
                     }
                 }
-            }
-        }
-    }
+            } // End of loop for channels, method 1
+#else // method 2
+// Looking for peak can span multiple buffers
+// timing  should be sample-accurate but midi isn't!
+            int remaining_frames; // Remaining in current buffer
+            int trig_frame, peak_frame, span;
+            char * buf_tail;
+            for(c = 0; c < channels; c++){
+				// Should have a loop to handle tail of buffer
+				remaining_frames = buf_frames;
+				buf_tail = buf;
+				// Sate will not necessarily extend to end of buffer,
+				// we need to loop over buffer chunks.
+				while (remaining_frames>0) {
+					if (state[c]!=old_state[c]){
+					    // fprintf (stderr, "%c %u %u->", state_names[old_state[c]][0], c, remaining_frames);
+					    fprintf (stderr, "%c %u %u ", state_names[state[c]][0], c, remaining_frames);
+					    old_state[c]=state[c];
+					}
+					switch (state[c]){
+						case STATE_IDLE:
+							// Look if trigger level is reached
+							trig_frame=(*f_trig)(channels, buf_tail, remaining_frames, c, trig_level[c]);
+							if (trig_frame>=0){  // Trigger level was reached
+								buf_tail += frame_bytes * (trig_frame+1);
+								remaining_frames -= trig_frame+1;
+								fprintf (stderr, "t%u r%u ", trig_frame, remaining_frames);
+								// prepare for next stage
+								state[c] = STATE_PEAK;
+								peak_level[c] = trig_level[c];
+								frame_count[c] = peak_frames[c];
+							}else{ // Trigger level was not reached in this buffer
+								remaining_frames = 0; // Maybe in next buffer...
+								// State stays STATE_IDLE
+							}
+							break;
+						case STATE_PEAK:
+							// look for peak within allowed time frame
+							span = min(remaining_frames, frame_count[c]);
+							(*f_peak)(channels, buf_tail, span, c, &peak_level[c]);
+							frame_count[c] -= span;
+							buf_tail += frame_bytes * span;
+							remaining_frames -= span;
+							if (frame_count[c]<=0){ // Is end of peak measurement window reached?
+								fprintf (stderr, "p:%u %u\n", peak_level[c], (127*peak_level[c])/max_sample_value);
+								// Send MIDI note
+								send_note_on(midi_channel[c], midi_note[c], (127*peak_level[c])/max_sample_value);
+								state[c] = STATE_WAIT;
+								// FIXME should be from actual peak frame
+								// but this is not necessarily in the current buffer
+								frame_count[c] += wait_frames[c];
+#ifdef debug
+							}else{
+								fprintf (stderr, "p");
+#endif
+							}
+							break;
+						default: // case STATE_WAIT:
+							frame_count[c] -= buf_frames;
+							// do nothing until retrigger guard is reached
+							if (frame_count[c]<=0){
+								// frame_count[c]+=buf_frames;
+								state[c] = STATE_IDLE;
+								remaining_frames = -frame_count[c];
+								buf_tail = buf + frame_bytes * (buf_frames - remaining_frames);
+							}else{ // Wait for whole buffer duration
+#ifdef debug
+								fprintf (stderr, "w");
+#endif
+								remaining_frames = 0;
+							}
+							break;
+					} // End of switch
+				} // End of while buffer chunk loop
+                if (note_off_delay[c]){
+                    note_off_delay[c]--;
+#ifdef debug
+                    fprintf (stderr, "n %u %u ", c, note_off_delay[c]);
+#endif
+                    if (note_off_delay[c] <= 0){
+                        note_off_delay[c] = 0;
+#ifdef debug
+                        fprintf (stderr, "\nx %u %lu ", c, bufcount);
+#endif
+                        send_note_off(midi_channel[c], midi_note[c]);
+                    }
+                }
+			} // End of loop for channels, method 2
+#endif
+        } // end of else read success
+    } // end of main read loop
 
     printf ("Terminating...\n");
     snd_pcm_close(capture_handle);
@@ -599,7 +832,24 @@ int main (int argc, char *argv[])
             snd_rawmidi_close(handle_out);  
     }
     if (buf) free(buf);
-
     exit (0);
 }
 
+#ifdef toto
+bonap@jack:/mnt/wd2tbk2p1/mp/mp_source/tap2midi$ ./tap2midi -D hw:0,0 -d 0.98 -t 8 -l -24
+audio device set to hw:0,0
+sample format set to S16_LE
+sample rate set to 44100
+channel count set to 2
+hardware parameters set
+audio interface prepared for use
+decay initial factor 6.000000 db, value 2.000000
+note off delay 86 buffers (249.614517 ms)
+re-trigger delay (buffers): 2 (5.804989 ms)
+buffer length: 128 frames (512 bytes)
+time per buffer: 2.902494 ms
+decay per buffer: 0.980000
+trigger level factor 15, value 2047
+About to start reading
+.I 0 128 I 1 128 ...............................................................................................^CInterrupted!
+#endif
