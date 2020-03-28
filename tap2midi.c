@@ -21,27 +21,34 @@
 */
 
 // Includes code from http://equalarea.com/paul/alsa-audio.html Minimal Capture Program
+
 // Compile with:
 // gcc tap2midi.c -lasound -lm -o tap2midi
+
 // Use example (maybe a bit conservative):
 // wait time 8ms, trigger level -24 db
 // ./tap2midi -D hw:3,0 -d 0.98 -t 8 -l -24
 // A little more responsive:
 // -d 0.98 -t 0 -l -30
 // Method 2:
-// ./tap2midi -D hw:2,0 -t 10 -w 100 -l -12
+// ./tap2midi -D hw:2,0 -t 2 -w 25 -l -12
 // NB - to identify your soundcard (hw:3,0 above), use
 // arecord -l
 
 // Currently hard-coded to S24_3LE sample format
 // int must be at least 32 bits
 
+// Method 1:
 // Debouncing uses 2 different mechanisms, which can be combined:
 // - set a certain delay time before retriggering is allowed
 //   use parameter -t followed by milliseconds
 // - trigger only if level exceeds a decreasing envelope
 //   use parameter -d followed by decay rate per buffer FIXME
 //   and parameter -g guard factor (envelope overshoot) FIXME
+
+// Method 2:
+// When trigger level is reached, detect peak within t ms
+// After peak detection, wait for w ms before re-triggering is allowed
 
 // TODO list
 // flush stdout at every printf
@@ -67,7 +74,7 @@
 
 // #define debug
 
-#define buf_frames (256)
+#define buf_frames (128)
 // #define channels (2)
 // #define channel_bytes (3)
 // #define frame_bytes (channels*channel_bytes)
@@ -249,8 +256,8 @@ void usage(char *prog_name){
     printf("-l level    trigger level (db, must be negative)\n");
     printf("            typically -36..-24, more negative values mean more sensitivity\n");
     printf("-r rate     sample rate (Hz)\n");
-    printf("-t time     retrigger delay time (ms)\n");
-    printf("            typically 0, higher values mean more anti-bouncing\n");
+    printf("-t time     trigger delay time (ms)\n");
+    printf("-w time     retrigger wait delay time for anti-bouncing (ms)\n");
     printf("-v          verbose\n");
     printf("-x time     note off (extinction) delay time (ms)\n");
     printf("-X          force note off (extinction) before new note\n");
@@ -739,6 +746,7 @@ int main (int argc, char *argv[])
 // timing  should be sample-accurate but midi isn't!
             int remaining_frames; // Remaining in current buffer
             int trig_frame, peak_frame, span;
+            int velocity;
             char * buf_tail;
             for(c = 0; c < channels; c++){
 				// Should have a loop to handle tail of buffer
@@ -747,11 +755,13 @@ int main (int argc, char *argv[])
 				// Sate will not necessarily extend to end of buffer,
 				// we need to loop over buffer chunks.
 				while (remaining_frames>0) {
+#ifdef debug					
 					if (state[c]!=old_state[c]){
 					    // fprintf (stderr, "%c %u %u->", state_names[old_state[c]][0], c, remaining_frames);
 					    fprintf (stderr, "%c %u %u ", state_names[state[c]][0], c, remaining_frames);
 					    old_state[c]=state[c];
 					}
+#endif					
 					switch (state[c]){
 						case STATE_IDLE:
 							// Look if trigger level is reached
@@ -759,7 +769,9 @@ int main (int argc, char *argv[])
 							if (trig_frame>=0){  // Trigger level was reached
 								buf_tail += frame_bytes * (trig_frame+1);
 								remaining_frames -= trig_frame+1;
+#ifdef debug
 								fprintf (stderr, "t%u r%u ", trig_frame, remaining_frames);
+#endif								
 								// prepare for next stage
 								state[c] = STATE_PEAK;
 								peak_level[c] = trig_level[c];
@@ -777,13 +789,17 @@ int main (int argc, char *argv[])
 							buf_tail += frame_bytes * span;
 							remaining_frames -= span;
 							if (frame_count[c]<=0){ // Is end of peak measurement window reached?
-								fprintf (stderr, "p:%u %u\n", peak_level[c], (127*peak_level[c])/max_sample_value);
+								velocity = 1+126*(peak_level[c]-trig_level[c])/(max_sample_value-trig_level[c]);
+#ifdef debug								
+								fprintf (stderr, "p:%u v:%u\n", peak_level[c], velocity);
+#endif								
 								// Send MIDI note
-								send_note_on(midi_channel[c], midi_note[c], (127*peak_level[c])/max_sample_value);
+								send_note_on(midi_channel[c], midi_note[c], velocity);
 								state[c] = STATE_WAIT;
 								// FIXME should be from actual peak frame
 								// but this is not necessarily in the current buffer
 								frame_count[c] += wait_frames[c];
+								note_off_delay[c] = max_note_off_delay_bufs;
 #ifdef debug
 							}else{
 								fprintf (stderr, "p");
@@ -835,7 +851,7 @@ int main (int argc, char *argv[])
     exit (0);
 }
 
-#ifdef toto
+/* Sample output
 bonap@jack:/mnt/wd2tbk2p1/mp/mp_source/tap2midi$ ./tap2midi -D hw:0,0 -d 0.98 -t 8 -l -24
 audio device set to hw:0,0
 sample format set to S16_LE
@@ -852,4 +868,4 @@ decay per buffer: 0.980000
 trigger level factor 15, value 2047
 About to start reading
 .I 0 128 I 1 128 ...............................................................................................^CInterrupted!
-#endif
+*/
